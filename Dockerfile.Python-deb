@@ -1,0 +1,72 @@
+# Stage 1: Build and Package
+FROM ubuntu:24.04 AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# 1. Install Build Dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc-14 g++-14 build-essential dpkg-dev \
+    libssl-dev zlib1g-dev libncurses5-dev libncursesw5-dev \
+    libreadline-dev libsqlite3-dev libgdbm-dev libdb5.3-dev \
+    libbz2-dev libexpat1-dev liblzma-dev libffi-dev uuid-dev \
+    tk-dev pkg-config wget libnsl-dev libtirpc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Zen 5 (Strix Halo) Optimization Flags
+ENV CC=gcc-14
+ENV CXX=g++-14
+ENV CFLAGS="-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -flto=auto  -pipe"
+ENV LDFLAGS="-flto=auto -Wl,-O1 -Wl,--as-needed"
+
+ENV VERSION=3.13.14
+
+WORKDIR /build
+COPY Python-${VERSION}/ ./Python-${VERSION}/
+WORKDIR /build/Python-${VERSION}
+
+# 3. Configure and Build
+RUN ax_cv_c_float_words_bigendian=no ./configure \
+    --enable-optimizations \
+    --with-lto \
+    --enable-shared \
+    --prefix=/usr/local \
+    --enable-loadable-sqlite-extensions
+
+RUN make -j$(nproc)
+
+# 4. Staging the Package Root
+RUN mkdir -p /pkg/python-strix/DEBIAN
+RUN make altinstall DESTDIR=/pkg/python-strix
+
+# 5. Add PATH environment script
+# This makes python3.13 available in the shell automatically
+RUN mkdir -p /pkg/python-strix/etc/profile.d && \
+    echo 'export PATH="/usr/local/bin:$PATH"' > /pkg/python-strix/etc/profile.d/python313.sh && \
+    chmod 644 /pkg/python-strix/etc/profile.d/python313.sh
+
+# 6. Generate Debian Metadata
+WORKDIR /pkg/python-strix
+RUN echo "Package: python-${VERSION}-strix\n\
+Version: ${VERSION}-1\n\
+Architecture: amd64\n\
+Maintainer: Custom Build\n\
+Depends: libc6, libssl3t64, libsqlite3-0, libreadline8t64, zlib1g, libbz2-1.0, liblzma5, libffi8, libncursesw6, libtirpc3t64, libnsl2\n\
+Section: python\n\
+Priority: optional\n\
+Description: Python ${VERSION} optimized for AMD Strix Halo (Zen 5)." > DEBIAN/control
+
+# Post-install script: Update linker and ensure PATH script is recognized
+RUN echo "#!/bin/sh\n\
+set -e\n\
+ldconfig /usr/local/lib\n\
+" > DEBIAN/postinst && chmod 755 DEBIAN/postinst
+
+# 7. Build the .deb
+RUN mkdir -p /output && dpkg-deb --build . /output/python-${VERSION}-strix.deb
+
+# Stage 2: Export Stage
+FROM scratch AS export
+ENV VERSION=3.13.14
+
+COPY --from=builder /output/python-${VERSION}-strix.deb /
+

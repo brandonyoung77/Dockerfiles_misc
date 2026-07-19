@@ -1,0 +1,77 @@
+# 1. Base Setup
+# Switched from Ubuntu to Debian Trixie to match LMDE 7 base
+FROM debian:trixie AS builder
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 2. Install Build Tools & Dependencies
+# Included 'ca-certificates' to allow git to verify SSL connections
+RUN apt update && apt install -y --no-install-recommends \
+    ca-certificates \
+    git build-essential pkg-config cmake curl ninja-build meson \
+    autoconf autoconf-archive automake bison libtool libgl1-mesa-dev \
+    gcc-14 g++-14 \
+    qt6-base-dev libasound2-dev libjack-jackd2-dev libpulse-dev portaudio19-dev \
+    file dpkg-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100
+
+# 3. Aggressive Optimization Flags for Strix Halo (Zen 5)
+ENV CFLAGS="-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -flto=auto -pipe -fPIC -fno-semantic-interposition"
+ENV CXXFLAGS="${CFLAGS}"
+ENV LDFLAGS="-flto=auto -Wl,-O1 -Wl,--as-needed -Wl,-z,now"
+
+# 4. Source Acquisition
+RUN git clone https://github.com/munt/munt.git && cd munt && git checkout libmt32emu_2_8_2
+
+# Create the desktop entry inside the Docker image
+# FIXED: Path corrected to /munt/mt32emu-qt.desktop to match the copy command below
+RUN printf "[Desktop Entry]\n\
+Type=Application\n\
+Name=Munt MT-32 Emulator\n\
+Comment=Roland MT-32, CM-32L and LAPC-I synthesizer emulator\n\
+Exec=mt32emu-qt\n\
+Icon=mt32emu-qt\n\
+Terminal=false\n\
+Categories=AudioVideo;Audio;Synthesizer;Qt;\n" > /munt/mt32emu-qt.desktop
+
+# 5. Build & Package CORE LIBRARY (libmt32emu)
+WORKDIR /munt/mt32emu
+RUN cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DMT32EMU_WITH_QT:BOOL=OFF \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCPACK_GENERATOR="DEB" \
+    -DCPACK_PACKAGE_NAME="libmt32emu" \
+    -DCPACK_PACKAGE_VERSION="2.8.2" \
+    -DCPACK_DEBIAN_PACKAGE_MAINTAINER="Brandon <brandon@framework-desktop>" . && \
+    cmake --build build --parallel $(nproc) && \
+    cd build && cpack -G DEB && \
+    dpkg -i *.deb
+
+# 6. Build & Package GUI (mt32emu-qt)
+WORKDIR /munt/mt32emu_qt
+RUN cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCPACK_GENERATOR="DEB" \
+    -DCPACK_PACKAGE_NAME="mt32emu-qt" \
+    -DCPACK_PACKAGE_VERSION="2.8.2" \
+    -DCPACK_DEBIAN_PACKAGE_MAINTAINER="Brandon <brandon@framework-desktop>" \
+    -DCPACK_DEBIAN_PACKAGE_DEPENDS="libmt32emu (>= 2.8.0), qt6-base-dev" . && \
+    cmake --build build --parallel $(nproc)
+
+# Manually "install" the desktop file and icon into the build tree for CPack
+RUN mkdir -p build/usr/share/applications && \
+    cp /munt/mt32emu-qt.desktop build/usr/share/applications/ && \
+    mkdir -p build/usr/share/icons/hicolor/scalable/apps && \
+    (cp data/mt32emu-qt.svg build/usr/share/icons/hicolor/scalable/apps/ || \
+     find /munt -name "mt32emu-qt.svg" -exec cp {} build/usr/share/icons/hicolor/scalable/apps/ \;)
+
+RUN cd build && cpack -G DEB
+
+# 7. Export the .deb
+FROM scratch AS export
+COPY --from=builder /munt/mt32emu/build/*.deb /
+COPY --from=builder /munt/mt32emu_qt/build/*.deb /

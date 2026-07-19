@@ -1,0 +1,86 @@
+# Stage 1: Build Environment (Debian Trixie for GCC 14.2)
+FROM debian:trixie AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Optimized flags for Strix Halo (Zen 5) architecture
+ENV CFLAGS="-O3 -march=znver5 -mtune=znver5 -fno-plt"
+ENV CXXFLAGS="-O3 -march=znver5 -mtune=znver5 -fno-plt"
+
+# Install build dependencies.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    autoconf automake build-essential ca-certificates cmake git libass-dev libbz2-dev libfontconfig-dev \
+    libfreetype6-dev libfribidi-dev libharfbuzz-dev libjansson-dev liblzma-dev libmp3lame-dev \
+    libnuma-dev libogg-dev libopus-dev libsamplerate0-dev libspeex-dev libtheora-dev \
+    libtool libtool-bin libturbojpeg0-dev libvorbis-dev libx264-dev libxml2-dev libvpx-dev \
+    m4 make meson nasm ninja-build patch pkg-config python3 tar zlib1g-dev libva-dev \
+    libdrm-dev libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    gettext appstream desktop-file-utils gstreamer1.0-plugins-good gstreamer1.0-libav && \
+    rm -rf /var/lib/apt/lists/*   
+
+WORKDIR /src
+RUN git clone https://github.com/HandBrake/HandBrake.git /src/HandBrake
+WORKDIR /src/HandBrake
+
+# Fetch the latest release tag (e.g., 1.11.2)
+RUN git fetch --tags && \
+    LATEST_TAG=$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1) && \
+    git checkout "$LATEST_TAG" && \
+    echo "Building HandBrake version: $LATEST_TAG"
+
+# Configure HandBrake
+# --enable-vce enables AMD VCN hardware encoding [1].
+# GTK is enabled by default unless --disable-gtk is specified, so both CLI and GUI will be built.
+RUN ./configure --launch-jobs=$(nproc) --enable-vce
+
+# Build HandBrake
+RUN make -C build -j$(nproc)
+
+# Install to a staging directory (DESTDIR)
+# This mimics 'make install' but puts files in /pkg instead of /usr/local
+# This ensures binaries go to /pkg/usr/local/bin, icons to /pkg/usr/local/share, etc.
+RUN make -C build install DESTDIR=/pkg
+
+# --- Stage 2: Packaging ---
+FROM debian:trixie AS packager
+
+RUN apt-get update && apt-get install -y --no-install-recommends dpkg && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy the fully staged installation from the builder
+# The structure is now correct: /pkg/usr/local/bin/ghb and /pkg/usr/local/bin/HandBrakeCLI
+COPY --from=builder /pkg /pkg
+
+# Prepare the package structure
+RUN mkdir -p /pkg/DEBIAN
+
+# Create a proper Debian control file with dependencies for Debian Trixie
+# Note: Library versions (e.g., libx265-215) must match what is actually in Trixie repos.
+# If unsure, 'dpkg -l | grep libname' inside a clean Trixie container reveals the exact version.
+RUN cat > /pkg/DEBIAN/control << 'EOL'
+Package: handbrake-optimized
+Version: 1.11.2-1
+Section: video
+Priority: optional
+Architecture: amd64
+Maintainer: Optimized Builder <builder@example.com>
+Depends: libc6 (>= 2.38), libglib2.0-0t64, libx264-164, libx265-215,libturbojpeg0,  
+         libfontconfig1, libfreetype6, libgtk-4-1, libgstreamer1.0-0, 
+         libgstreamer-plugins-base1.0-0, libass9, libbz2-1.0, liblzma5, 
+         libnuma1, libogg0, libopus0, libsamplerate0, libspeex1, libtheora0, 
+         libvorbis0a, libvorbisenc2, libvorbisfile3, libxml2, libvpx9, 
+         libdav1d7, libsvtav1enc2, python3, appstream, desktop-file-utils
+Description: Optimized HandBrake for AMD Zen 5 (Strix Halo)
+ HandBrake is an open-source video transcoder. This build is optimized
+ for AMD Ryzen AI (Strix Halo) processors using the znver5 architecture.
+ Includes both CLI (HandBrakeCLI) and GUI (ghb).
+ .
+ This package was compiled from source with custom CPU optimizations.
+EOL
+
+# Build the .deb
+RUN dpkg-deb --build --root-owner-group /pkg /HandBrake-optimized.deb    
+
+# Stage 3: Output (Minimal image containing just the .deb)
+FROM scratch
+COPY --from=packager /HandBrake-optimized.deb /

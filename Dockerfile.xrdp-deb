@@ -1,0 +1,190 @@
+FROM debian:trixie AS builder
+
+#enable non-free sources
+RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources
+
+
+# 1. Install build dependencies (Comprehensive flag and driver coverage)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git autoconf automake libtool pkg-config ca-certificates \
+    dpkg-dev fakeroot \
+    libssl-dev libpam0g-dev libx11-dev libxfixes-dev libxrandr-dev \
+    libpixman-1-dev nasm libdrm-dev libxfont-dev \
+    libpipewire-0.3-dev libspa-0.2-dev \
+    # --- New required headers for all of your ./configure flags ---
+    libmp3lame-dev libfdk-aac-dev libopus-dev \
+    libx264-dev libopenh264-dev libjpeg62-turbo-dev \
+    libfuse3-dev libfreetype-dev libimlib2-dev \
+    libibus-1.0-dev libsystemd-dev libepoxy-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# 2. Install local xlibre debs
+COPY debs/xlibre-server_25.1.8-1_amd64.deb /tmp/debs/
+COPY debs/xlibre-server-dev_25.1.8-1_amd64.deb /tmp/debs/
+RUN apt-get update && apt-get install -y /tmp/debs/*.deb \
+    && rm -rf /tmp/debs
+
+WORKDIR /build
+RUN mkdir -p /out
+
+# Helper script to generate DEBIAN/control files
+RUN cat > /build/make-control.sh << 'SCRIPT'
+#!/bin/bash
+mkdir -p "$1/DEBIAN"
+cat > "$1/DEBIAN/control" << CONTROL_EOF
+Package: $2
+Version: $3
+Architecture: amd64
+Maintainer: Custom Build for xlibre
+Replaces: $4
+Conflicts: $4
+Depends: $5
+Description: $6
+CONTROL_EOF
+SCRIPT
+RUN chmod +x /build/make-control.sh
+
+# ==========================================================
+# STEP A: Build & Install xrdp to /usr (satisfies xorgxrdp deps)
+# ==========================================================
+RUN git clone --branch v0.10.6.1 --depth 1 https://github.com/neutrinolabs/xrdp.git && \
+    cd xrdp && \
+    ./bootstrap && \
+    ./configure --prefix=/usr --with-systemdsystemunitdir=/usr/lib/systemd/system \
+    --enable-ibus --enable-ipv6 --enable-jpeg --enable-fuse --enable-mp3lame \
+    --enable-fdkaac --enable-opus --enable-rfxcodec --enable-painter \
+    --enable-pixman --enable-utmp --with-imlib2 --with-freetype2 \
+    --enable-x264 --enable-openh264 --enable-vsock && \
+    make -j$(nproc) && \
+    make install
+
+# ==========================================================
+# STEP B: Build & Install xorgxrdp
+# ==========================================================
+RUN git clone --branch v0.10.5 --depth 1 https://github.com/neutrinolabs/xorgxrdp.git && \
+    cd xorgxrdp && \
+    sed -i 's|xorg-server >=|xlibre-server >=|g' configure.ac && \
+    sed -i 's|\[xorg-server\]|[xlibre-server]|g' configure.ac && \
+    sed -i 's|xserver-xorg-dev, xorg-x11-server-sdk or xorg-x11-server-devel|xlibre-server-dev|g' configure.ac && \
+    sed -i 's|\[\[#include \]\])|[[\n#include <xorg-server.h>\n#include <xserver-properties.h>\n    ]])|' configure.ac && \
+    sed -i 's|keylayout 0x%8\.8x variant %s display %s",|keylayout 0x%8.8x variant %s",|' xrdpkeyb/rdpKeyboard.c && \
+    sed -i 's|keylayout, client_info->variant, display));|keylayout, client_info->variant));|' xrdpkeyb/rdpKeyboard.c && \
+    ./bootstrap && \
+    sed -i 's|module`pkg-config xorg-server --variable=moduledir`|moduledir="/usr/lib/xorg/modules/xlibre-25"|' configure && \
+    sed -i 's|sysinputdir="$moduledir/input"|sysinputdir="/usr/lib/xorg/modules/xlibre-25/input"|' configure && \
+    CFLAGS="$CFLAGS -ffat-lto-objects -DNullClient=NULL $(pkg-config --cflags-only-I libdrm)" ./configure --prefix=/usr --enable-glamor && \
+    make -j$(nproc) && \
+    make install
+
+# ==========================================================
+# STEP C: Package xrdp into a .deb
+# ==========================================================
+RUN cd /build/xrdp && \
+    /build/make-control.sh /build/xrdp-deb "xlibre-xrdp" "0.10.6.1-1" "xrdp" \
+    "libssl3 (>= 3.0.0), libpam0g (>= 1.5.2), libx11-6 (>= 2:1.8.4), libxfixes3, libxrandr2, ssl-cert, libmp3lame0, libfdk-aac2, libopus0, libx264-164 | libx264-161 | libopenh264-7 | libopenh264-8, libjpeg62-turbo, libfuse3-4, libfreetype6, libimlib2, libibus-1.0-5, libpixman-1-0, libsystemd0" \
+    "Open source RDP server with drive, audio, and microphone redirection" && \
+    make DESTDIR=/build/xrdp-deb install
+
+# Add xrdp postinst script
+RUN cat > /build/xrdp-deb/DEBIAN/postinst << 'POSTINST'
+#!/bin/bash
+set -e
+[ -z "$DPKG_MAINTSCRIPT_PACKAGE" ] && exit 0
+
+if ! getent group xrdp > /dev/null; then addgroup --system xrdp; fi
+if ! getent passwd xrdp > /dev/null; then adduser --system --ingroup xrdp --home /run/xrdp --no-create-home --shell /usr/sbin/nologin xrdp; fi
+
+# This tells xrdp to drop its privileges automatically right after binding to port 3389
+sed -i 's|^#[[:space:]]*runtime_user=.*|runtime_user=xrdp|' /etc/xrdp/xrdp.ini
+sed -i 's|^#[[:space:]]*runtime_group=.*|runtime_group=xrdp|' /etc/xrdp/xrdp.ini
+sed -i 's|^#[[:space:]]*SessionSockdirGroup=.*|SessionSockdirGroup=xrdp|' /etc/xrdp/sesman.ini
+
+sed -i '/\. \/etc\/X11\/Xsession/i \    unset DBUS_SESSION_BUS_ADDRESS\n    unset XDG_RUNTIME_DIR' /etc/xrdp/startwm.sh
+
+
+
+# 2. Configure certificate paths
+sed -i 's|^certificate=.*|certificate=/etc/xrdp/cert.pem|' /etc/xrdp/xrdp.ini
+sed -i 's|^key_file=.*|key_file=/etc/xrdp/key.pem|' /etc/xrdp/xrdp.ini
+
+if [ -f /etc/xrdp/rsakeys.ini ]; then 
+    chmod 640 /etc/xrdp/rsakeys.ini
+    chown root:xrdp /etc/xrdp/rsakeys.ini
+fi
+
+# 3. Handle snakeoil certificates and permissions
+if [ ! -f /etc/xrdp/cert.pem ] || [ ! -f /etc/xrdp/key.pem ]; then
+    make-ssl-cert generate-default-snakeoil --force-overwrite > /dev/null 2>&1 || true
+    ln -sf /etc/ssl/certs/ssl-cert-snakeoil.pem /etc/xrdp/cert.pem
+    ln -sf /etc/ssl/private/ssl-cert-snakeoil.key /etc/xrdp/key.pem
+fi
+
+# Ensure xrdp group has read access to the keys before dropping root privileges
+chown root:xrdp /etc/ssl/private/ssl-cert-snakeoil.key /etc/xrdp/key.pem
+chmod 640 /etc/ssl/private/ssl-cert-snakeoil.key /etc/xrdp/key.pem
+usermod -a -G ssl-cert xrdp > /dev/null 2>&1 || true
+
+# 4. Set directory states
+mkdir -p /run/xrdp /run/xrdp/sockdir /var/log/xrdp
+chown -R xrdp:xrdp /run/xrdp /var/log/xrdp /etc/xrdp
+
+if command -v systemctl > /dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable xrdp.service xrdp-sesman.service
+fi
+exit 0
+POSTINST
+RUN chmod +x /build/xrdp-deb/DEBIAN/postinst && \
+    dpkg-deb --build /build/xrdp-deb /out/xlibre-xrdp_0.10.6.1-1_amd64.deb && \
+    rm -rf /build/xrdp /build/xrdp-deb
+
+# ==========================================================
+# STEP D: Package xorgxrdp into a .deb
+# ==========================================================
+RUN cd /build/xorgxrdp && \
+    /build/make-control.sh /build/xorg-deb "xlibre-orgxrdp" "0.10.5-1" "xorgxrdp" \
+    "xlibre-xrdp, xlibre-server, libpixman-1-0, libdrm2, libepoxy0" \
+    "XLibre drivers for xrdp" && \
+    make DESTDIR=/build/xorg-deb install
+
+# Add xorgxrdp postinst script
+RUN cat > /build/xorg-deb/DEBIAN/postinst << 'POSTINST'
+#!/bin/bash
+set -e
+[ -z "$DPKG_MAINTSCRIPT_PACKAGE" ] && exit 0
+if [ -f /etc/xrdp/sesman.ini ]; then
+    sed -i 's|^param=Xorg.*$|param=/usr/lib/xorg/Xorg|' /etc/xrdp/sesman.ini
+fi
+
+# Ensure the runtime directories exist with correct owner permissions
+mkdir -p /run/xrdp /run/xrdp/sockdir /var/log/xrdp
+chown -R xrdp:xrdp /run/xrdp /var/log/xrdp
+chmod 755 /run/xrdp
+
+if command -v systemctl > /dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl try-restart xrdp.service xrdp-sesman.service || true
+fi
+exit 0
+POSTINST
+RUN chmod +x /build/xorg-deb/DEBIAN/postinst && \
+    dpkg-deb --build /build/xorg-deb /out/xlibre-xorgxrdp_0.10.5-1_amd64.deb && \
+    rm -rf /build/xorgxrdp /build/xorg-deb
+
+# ==========================================================
+# STEP E: Package pipewire module
+# ==========================================================
+RUN git clone --branch v0.1 --depth 1 https://github.com/neutrinolabs/pipewire-module-xrdp.git && \
+    cd /build/pipewire-module-xrdp && \
+    ./bootstrap && ./configure --prefix=/usr && make -j$(nproc) && \
+    /build/make-control.sh /build/pw-deb "xlibre-pipewire-module-xrdp" "0.1-1" "pipewire-module-xrdp" \
+    "xlibre-xrdp, libpipewire-0.3-0, libspa-0.2-modules" \
+    "PipeWire module for xrdp audio and microphone redirection" && \
+    make DESTDIR=/build/pw-deb install && \
+    dpkg-deb --build /build/pw-deb /out/xlibre-pipewire-module-xrdp_0.1-1_amd64.deb && \
+    rm -rf /build/pipewire-module-xrdp /build/pw-deb
+
+# Stage 2: Output
+FROM scratch
+COPY --from=builder /out/*.deb /

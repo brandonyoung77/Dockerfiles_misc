@@ -1,0 +1,129 @@
+# STAGE 1: Builder
+FROM ubuntu:24.04 AS builder
+
+# Build-time arguments
+ARG GIT_TAG=master
+ARG DEB_VERSION=1.0.0-optimized
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install software-properties-common to manage repositories and enable multiverse
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    && add-apt-repository multiverse \
+    && apt-get update
+
+# Install dependencies with exact Ubuntu 24.04 package names
+RUN apt-get install -y \
+    # --- Group 1: Core Build Tools ---
+    git \
+    build-essential \
+    gcc-14 \
+    g++-14 \
+    pkg-config \
+    nasm \
+    yasm \
+    cmake \
+    libtool \
+    automake \
+    autoconf \
+    texinfo \
+    wget \
+    # --- Group 2: Codecs & Feature Libraries ---
+    libx264-dev \
+    libx265-dev \
+    libvpx-dev \
+    libfdk-aac-dev \
+    libmp3lame-dev \
+    libopus-dev \
+    libass-dev \
+    libfreetype6-dev \
+    libgnutls28-dev \
+    libvorbis-dev \
+    # --- Group 3: Hardware Acceleration ---
+    libva-dev \
+    libvulkan-dev \
+    libdrm-dev \
+    libvdpau-dev \
+    # --- Group 4: XCB/X11 Dependencies ---
+    libxcb-shm0-dev \
+    libxcb-xfixes0-dev \
+    libxcb-glx0-dev \
+    libxcb-present-dev \
+    libxcb-dri3-dev \
+    libxcb-sync-dev \
+    libxcb-xinput-dev \
+    libxcb-dri2-0-dev \
+    libxcb-randr0-dev \
+    libxcb-composite0-dev \
+    libxcb-damage0-dev \
+    libxcb-render-util0-dev \
+    libxcb-shape0-dev \
+    libxcb-xkb-dev \
+    libxkbcommon-dev \
+    libxcb-icccm4-dev \
+    libxcb-image0-dev \
+    libxcb-keysyms1-dev \
+    libxcb-res0-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set GCC 14 and G++ 14 as the default compilers
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 50 \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 50 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100
+
+# Verify compiler version
+RUN gcc --version && g++ --version
+
+# Clone FFmpeg source directly at the specified tag
+WORKDIR /src
+RUN git clone --depth 1 --branch ${GIT_TAG} https://git.ffmpeg.org/ffmpeg.git ffmpeg
+
+# Configure, Build, and Install with LTO and Hardware Optimization
+# Fixed: Removed --enable-vulkan. It will be enabled via [autodetect]
+WORKDIR /src/ffmpeg
+RUN ./configure \
+    --prefix=/usr \
+    --enable-gpl \
+    --enable-nonfree \
+    --enable-vaapi \
+    --enable-libx264 \
+    --enable-libx265 \
+    --enable-libvpx \
+    --enable-libfdk-aac \
+    --enable-libmp3lame \
+    --enable-libopus \
+    --enable-libass \
+    --enable-libfreetype \
+    --extra-cflags="-march=native -O3" \
+    --extra-ldflags="-march=native" \
+    && make -j$(nproc) \
+    && make install DESTDIR=/tmp/ffmpeg-install
+
+# STAGE 2: Packager
+FROM ubuntu:24.04 AS packager
+ARG DEB_VERSION
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y dpkg-dev && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /tmp/ffmpeg-install /pkg-root
+
+WORKDIR /pkg-root/DEBIAN
+RUN echo "Package: ffmpeg" > control && \
+    echo "Version: ${DEB_VERSION}" >> control && \
+    echo "Section: video" >> control && \
+    echo "Priority: optional" >> control && \
+    echo "Architecture: amd64" >> control && \
+    echo "Maintainer: Brandon <brandon@framework-desktop>" >> control && \
+    echo "Depends: libx264-164, libx265-199, libvpx9, libfdk-aac2, libmp3lame0, libopus0, libass9, libfreetype6, libva2, libvulkan1, libdrm2" >> control && \
+    echo "Conflicts: ffmpeg" >> control && \
+    echo "Replaces: ffmpeg" >> control && \
+    echo "Description: Optimized FFmpeg for AMD Ryzen AI Max+ 395 (Strix Halo) - Full Feature Set" >> control
+
+WORKDIR /pkg-root
+RUN dpkg-deb --build . /ffmpeg-optimized.deb
+
+# STAGE 3: Export
+FROM scratch AS export
+COPY --from=packager /ffmpeg-optimized.deb /

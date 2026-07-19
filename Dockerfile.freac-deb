@@ -1,0 +1,79 @@
+# 1. Base Setup
+FROM debian:trixie AS builder
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 2. Install Build Tools & Dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential gcc g++ pkg-config dpkg-dev git \
+    libgtk-3-dev libxml2-dev libcurl4-openssl-dev libexpat1-dev \
+    libpulse-dev libasound2-dev libflac-dev libmp3lame-dev \
+    libogg-dev libvorbis-dev libopus-dev libfribidi-dev \
+    libbz2-dev libjpeg62-turbo-dev libcdio-paranoia-dev liburiparser-dev \
+    libudev-dev libgl1-mesa-dev libopenblas-dev libfftw3-dev \
+    desktop-file-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3. Aggressive Optimization Flags for Strix Halo (Zen 5)
+ENV CFLAGS="-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -flto=auto -pipe -fPIC -fno-semantic-interposition"
+ENV CXXFLAGS="${CFLAGS}"
+ENV LDFLAGS="-flto=auto -Wl,-O1 -Wl,-as-needed -Wl,-z,now"
+WORKDIR /build
+
+# 4. Fetch and Build mandatory dependencies
+RUN git clone https://github.com/enzo1982/smooth.git && \
+    cd smooth && make -j$(nproc) && make install
+RUN git clone https://github.com/enzo1982/BoCA.git && \
+    cd BoCA && make -j$(nproc) && make install
+
+# 5. Copy local source and build
+COPY freac ./sources/freac
+RUN cd sources/freac && make -j$(nproc)
+
+# 6. Staging and Icon/Desktop Setup
+RUN mkdir -p /pkg/freac-strix/usr/local/share/icons/hicolor/scalable/apps && \
+    mkdir -p /pkg/freac-strix/usr/local/share/applications
+
+RUN cd /build/smooth && make install DESTDIR=/pkg/freac-strix
+RUN cd /build/BoCA && make install DESTDIR=/pkg/freac-strix
+RUN cd /build/sources/freac && make install DESTDIR=/pkg/freac-strix
+
+# Manually stage icons and desktop files from known source locations
+RUN cp /build/sources/freac/icons/freac.svg /pkg/freac-strix/usr/local/share/icons/hicolor/scalable/apps/freac.svg || \
+    find /build/sources/freac -name "freac.svg" -exec cp {} /pkg/freac-strix/usr/local/share/icons/hicolor/scalable/apps/freac.svg \;
+RUN cp /build/sources/freac/deployment/freac.desktop /pkg/freac-strix/usr/local/share/applications/freac.desktop || \
+    find /build/sources/freac -name "freac.desktop" -exec cp {} /pkg/freac-strix/usr/local/share/applications/freac.desktop \;
+
+# Ensure the .desktop file points to the correct binary and icon
+RUN if [ -f /pkg/freac-strix/usr/local/share/applications/freac.desktop ]; then \
+        sed -i 's|^Exec=.*|Exec=/usr/local/bin/freac|' /pkg/freac-strix/usr/local/share/applications/freac.desktop && \
+        sed -i 's|^Icon=.*|Icon=freac|' /pkg/freac-strix/usr/local/share/applications/freac.desktop; \
+    else \
+        printf "[Desktop Entry]\nName=fre:ac (Strix)\nExec=/usr/local/bin/freac\nIcon=freac\nType=Application\nCategories=AudioVideo;Audio;Recorder;\n" > /pkg/freac-strix/usr/local/share/applications/freac.desktop; \
+    fi
+
+# 7. Automated Debian Packaging
+WORKDIR /pkg/freac-strix
+RUN mkdir -p DEBIAN debian && \
+    VERSION="1.1.7-strix-$(date +%Y%m%d)" && \
+    # --- IMPROVED AUTOMATED DEPENDENCY DETECTION ---
+    BINARY="/pkg/freac-strix/usr/local/bin/freac" && \
+    # 1. Extract dependencies from the binary
+    RAW_DEPS=$(dpkg-shlibdeps -O "$BINARY" 2>/dev/null | sed 's/^Depends: //') && \
+    # 2. Check if RAW_DEPS is empty or whitespace
+    if [ -z "$(echo "$RAW_DEPS" | tr -d '[:space:]')" ]; then \
+        # Fallback if no libraries detected
+        FINAL_DEPS="libc6, desktop-file-utils"; \
+    else \
+        # Append the necessary tool dependency safely
+        FINAL_DEPS="${RAW_DEPS}, desktop-file-utils"; \
+    fi && \
+    # ------------------------------------------------
+    printf 'Source: freac-strix\nSection: sound\nPriority: optional\nMaintainer: Custom Build\n\nPackage: freac-strix\nArchitecture: amd64\nVersion: %s\nDepends: %s\nDescription: fre:ac optimized for Zen 5 (Strix Halo).\n' "$VERSION" "$FINAL_DEPS" > debian/control && \
+    printf 'Package: freac-strix\nVersion: %s\nSection: sound\nPriority: optional\nArchitecture: amd64\nMaintainer: Custom Build\nDepends: %s\nDescription: fre:ac optimized for Zen 5 (Strix Halo).\n' "$VERSION" "$FINAL_DEPS" > DEBIAN/control && \
+    printf '#!/bin/sh\nset -e\nldconfig\nupdate-desktop-database -q /usr/local/share/applications || true\ngtk-update-icon-cache -q -t -f /usr/local/share/icons/hicolor || true\n' > DEBIAN/postinst && \
+    chmod 755 DEBIAN/postinst && rm -rf debian
+RUN mkdir -p /output && dpkg-deb --build . /output/freac-strix.deb
+
+# 8. Export the .deb
+FROM scratch AS export
+COPY --from=builder /output/freac-strix.deb /
