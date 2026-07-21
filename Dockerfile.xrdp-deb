@@ -100,9 +100,8 @@ sed -i 's|^#[[:space:]]*runtime_user=.*|runtime_user=xrdp|' /etc/xrdp/xrdp.ini
 sed -i 's|^#[[:space:]]*runtime_group=.*|runtime_group=xrdp|' /etc/xrdp/xrdp.ini
 sed -i 's|^#[[:space:]]*SessionSockdirGroup=.*|SessionSockdirGroup=xrdp|' /etc/xrdp/sesman.ini
 
-sed -i '/\. \/etc\/X11\/Xsession/i \    unset DBUS_SESSION_BUS_ADDRESS\n    unset XDG_RUNTIME_DIR' /etc/xrdp/startwm.sh
-
-
+# Replace the execution of Xsession with dbus-run-session
+sed -i 's|^\. /etc/X11/Xsession|dbus-run-session /etc/X11/Xsession|' /etc/xrdp/startwm.sh
 
 # 2. Configure certificate paths
 sed -i 's|^certificate=.*|certificate=/etc/xrdp/cert.pem|' /etc/xrdp/xrdp.ini
@@ -182,6 +181,10 @@ RUN git clone --branch v0.1 --depth 1 https://github.com/neutrinolabs/pipewire-m
     "xlibre-xrdp, libpipewire-0.3-0, libspa-0.2-modules" \
     "PipeWire module for xrdp audio and microphone redirection" && \
     make DESTDIR=/build/pw-deb install && \
+    # --- ADD THIS PART: Create the config drop-in ---
+    mkdir -p /build/pw-deb/usr/share/pipewire/pipewire.conf.d/ && \
+    echo 'context.modules = [ \n    { name = libpipewire-module-xrdp.so } \n]' > /build/pw-deb/usr/share/pipewire/pipewire.conf.d/xrdp.conf && \
+    # ----------------------------------------------
     dpkg-deb --build /build/pw-deb /out/xlibre-pipewire-module-xrdp_0.1-1_amd64.deb && \
     rm -rf /build/pipewire-module-xrdp /build/pw-deb
 
