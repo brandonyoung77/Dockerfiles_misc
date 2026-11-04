@@ -23,7 +23,7 @@ ENV CXXFLAGS="${CFLAGS}"
 ENV LDFLAGS="-flto=auto -Wl,-O1 -Wl,--as-needed -Wl,-z,now"
 
 # 4. Source Acquisition
-RUN git clone https://github.com/munt/munt.git && cd munt && git checkout libmt32emu_2_8_2
+RUN git clone https://github.com/munt/munt.git && cd munt && git checkout libmt32emu_2_8_3
 
 # Create the desktop entry inside the Docker image
 # FIXED: Path corrected to /munt/mt32emu-qt.desktop to match the copy command below
@@ -44,7 +44,7 @@ RUN cmake -B build \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCPACK_GENERATOR="DEB" \
     -DCPACK_PACKAGE_NAME="libmt32emu" \
-    -DCPACK_PACKAGE_VERSION="2.8.2" \
+    -DCPACK_PACKAGE_VERSION="2.8.3" \
     -DCPACK_DEBIAN_PACKAGE_MAINTAINER="Brandon <brandon@framework-desktop>" . && \
     cmake --build build --parallel $(nproc) && \
     cd build && cpack -G DEB && \
@@ -57,7 +57,7 @@ RUN cmake -B build \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCPACK_GENERATOR="DEB" \
     -DCPACK_PACKAGE_NAME="mt32emu-qt" \
-    -DCPACK_PACKAGE_VERSION="2.8.2" \
+    -DCPACK_PACKAGE_VERSION="2.8.3" \
     -DCPACK_DEBIAN_PACKAGE_MAINTAINER="Brandon <brandon@framework-desktop>" \
     -DCPACK_DEBIAN_PACKAGE_DEPENDS="libmt32emu (>= 2.8.0), qt6-base-dev" . && \
     cmake --build build --parallel $(nproc)
