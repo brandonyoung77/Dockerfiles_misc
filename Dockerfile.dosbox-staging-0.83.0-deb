@@ -19,6 +19,31 @@ RUN apt update && apt install -y \
     perl bison flex python3-venv python3-pip python3-jinja2 gperf \
     && rm -rf /var/lib/apt/lists/*
 
+# GCC 16 / G++ 16 (16.2.0-3) for the build. GCC 16 is the first release to
+# enable the full Zen 5 AVX-512 feature set (AVX512_BMM, AVX512_VNNI,
+# AVX-VNNI, ...) for -march=znver5 and to use masked AVX-512 vector epilogues
+# in auto-vectorization on znver4/znver5/znver6.
+#
+# Not in trixie nor trixie-backports — only in forky (testing). Add forky as
+# a second suite and install ONLY the pinned compiler family. The
+# exact-version deps (cpp-16, libcc1-0, libgcc-16-dev, libstdc++-16-dev, ...)
+# come from forky; every other dep (binutils >= 2.39, libc6-dev >= 2.23, gmp,
+# mpfr, ...) is already satisfied by the trixie build-essential install above,
+# so trixie's glibc/binutils are NOT bumped. Only the GCC-16 runtime support
+# libs (libgcc-s1, libstdc++6, libgomp1, ...) are upgraded — builder-only:
+# the final binary statically links libgcc/libstdc++ (LDFLAGS below) and none
+# of these ever land in the deb.
+#
+# NOTE: installed by plain name + explicit version pin. apt 3.0.3 (trixie)
+# rejects the `forky/gcc-16` release-qualified syntax ("E: Unable to locate
+# package forky") — verified empirically against both the codename and
+# "testing" suite names.
+RUN printf 'Types: deb\nURIs: http://deb.debian.org/debian\nSuites: forky\nComponents: main\n' \
+      > /etc/apt/sources.list.d/forky.sources \
+    && apt update \
+    && apt install -y gcc-16=16.2.0-3 g++-16=16.2.0-3 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Zen 5 tuned flags. CFLAGS/LDFLAGS reach the AUTOTOOLS-based vcpkg ports
 # (alsa, opus, speexdsp, ...); CMake-based ports (fluidsynth, sdl2,
 # dosbox-staging itself) do NOT read env flags — they get the tuning from
@@ -29,8 +54,11 @@ RUN apt update && apt install -y \
 # in LTO bytecode that only materializes during an LTO link. The CMake
 # ports link non-LTO, so an LTO-built libasound.a comes up with
 # undefined references.
-ENV CC=/usr/bin/gcc
-ENV CXX=/usr/bin/g++
+#
+# Explicit gcc-16/g++-16 (installed above): autotools vcpkg ports pick up
+# the compiler from CC/CXX; the CMake configure below pins it separately.
+ENV CC=/usr/bin/gcc-16
+ENV CXX=/usr/bin/g++-16
 ENV CFLAGS="-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -pipe -fPIC -fno-semantic-interposition"
 ENV CXXFLAGS="${CFLAGS}"
 ENV LDFLAGS="-Wl,-O1 -Wl,--as-needed -Wl,-z,now -static-libgcc -static-libstdc++"
@@ -96,8 +124,8 @@ RUN git checkout v0.83.0
 # Configure CMake with Ninja and custom release triplet
 RUN cmake -G Ninja --preset=release-linux-vcpkg \
     -DCMAKE_INSTALL_PREFIX=/usr \
-    -DCMAKE_C_COMPILER=/usr/bin/gcc \
-    -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
+    -DCMAKE_C_COMPILER=/usr/bin/gcc-16 \
+    -DCMAKE_CXX_COMPILER=/usr/bin/g++-16 \
     -DVCPKG_TARGET_TRIPLET=x64-linux-release \
     -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja
 
