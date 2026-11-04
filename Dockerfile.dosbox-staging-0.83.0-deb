@@ -1,0 +1,150 @@
+# 1. Base Setup (Builder)
+FROM debian:trixie AS builder
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Complete list of build, vcpkg host, and system library dependencies.
+# NOTE: the X11/Wayland/ALSA/EGL dev packages matter — vcpkg's SDL2 port
+# compiles the x11+wayland video backends against these system libraries
+# (they are dlopen'ed at runtime), so each one also becomes a runtime
+# dependency in the DEBIAN control file below.
+RUN apt update && apt install -y \
+    gcc g++ git build-essential pkg-config cmake curl ninja-build \
+    libsdl2-dev libsdl2-net-dev libfluidsynth-dev \
+    libslirp-dev libopusfile-dev libasound2-dev libgl1-mesa-dev \
+    libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+    libxfixes-dev libxss-dev libxrender-dev libxinerama-dev libxkbcommon-dev \
+    libwayland-dev libegl1-mesa-dev libibus-1.0-dev \
+    libsndfile1-dev libdbus-1-dev \
+    zip unzip tar autoconf autoconf-archive automake libtool gettext \
+    perl bison flex python3-venv python3-pip python3-jinja2 gperf \
+    && rm -rf /var/lib/apt/lists/*
+
+# Zen 5 tuned flags. CFLAGS/LDFLAGS reach the AUTOTOOLS-based vcpkg ports
+# (alsa, opus, speexdsp, ...); CMake-based ports (fluidsynth, sdl2,
+# dosbox-staging itself) do NOT read env flags — they get the tuning from
+# the triplet below (VCPKG_C_FLAGS / VCPKG_CXX_FLAGS).
+#
+# NOTE: no -flto anywhere. LTO objects keep file-scope `.set` symbol
+# aliases (alsa-lib's plain public snd_pcm_hw_params_set_*_near names)
+# in LTO bytecode that only materializes during an LTO link. The CMake
+# ports link non-LTO, so an LTO-built libasound.a comes up with
+# undefined references.
+ENV CC=/usr/bin/gcc
+ENV CXX=/usr/bin/g++
+ENV CFLAGS="-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -pipe -fPIC -fno-semantic-interposition"
+ENV CXXFLAGS="${CFLAGS}"
+ENV LDFLAGS="-Wl,-O1 -Wl,--as-needed -Wl,-z,now -static-libgcc -static-libstdc++"
+
+# Bootstrap vcpkg
+WORKDIR /opt
+RUN git clone https://github.com/microsoft/vcpkg.git
+ENV VCPKG_ROOT=/opt/vcpkg
+RUN /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+# Create custom release-only triplet to avoid debug build issues.
+# NOTE: written with printf — /bin/sh (dash) echo does NOT interpret \n,
+# so `echo "set(...)\nset(...)"` produces one line of literal "\n" text
+# and vcpkg fails to parse the triplet.
+RUN printf '%s\n' \
+      'set(VCPKG_TARGET_ARCHITECTURE x64)' \
+      'set(VCPKG_CRT_LINKAGE dynamic)' \
+      'set(VCPKG_LIBRARY_LINKAGE static)' \
+      'set(VCPKG_CMAKE_SYSTEM_NAME Linux)' \
+      'set(VCPKG_BUILD_TYPE release)' \
+      'set(VCPKG_C_FLAGS "-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -pipe -fPIC")' \
+      'set(VCPKG_CXX_FLAGS "-O3 -march=znver5 -mtune=znver5 -mprefer-vector-width=512 -pipe -fPIC -fno-semantic-interposition")' \
+      > /opt/vcpkg/triplets/x64-linux-release.cmake
+
+# vcpkg overlay ports (required for the static triplet).
+#
+# fluidsynth: the pinned baseline portfile force-passes -DALSA_FOUND=ON,
+# which makes CMake's find_package(ALSA) short-circuit and leave
+# ALSA_LIBRARIES empty. Harmless with a dynamic triplet, but with
+# VCPKG_LIBRARY_LINKAGE=static the link fails with undefined snd_pcm_*
+# references. Download the baseline port verbatim and drop the forced
+# variable so find_package(ALSA) runs for real (the "alsa" port is
+# already a declared dependency and provides alsa.pc).
+#
+# alsa: alsa-lib 1.2.x renames its public symbols internally (__name) and
+# only exposes the public names via symver when building a shared library.
+# In a static archive the plain public symbols (e.g.
+# snd_pcm_hw_params_set_rate_near) are absent, so statically linked
+# consumers (fluidsynth, dosbox-staging) fail with undefined references.
+# Build with --without-versioned so the .set-alias fallback emits the
+# plain symbols. (Also keep -flto out of CFLAGS — see above; LTO objects
+# hide these .set aliases from non-LTO links.)
+RUN set -e; \
+    B=6283825b81bb60f952af1d0703638df1de611243; \
+    mkdir -p /opt/overlay-ports/fluidsynth /opt/overlay-ports/alsa; \
+    for f in vcpkg.json portfile.cmake fix-gcem.patch usage; do \
+        curl -fsSL "https://raw.githubusercontent.com/microsoft/vcpkg/$B/ports/fluidsynth/$f" \
+            -o "/opt/overlay-ports/fluidsynth/$f"; \
+    done; \
+    for f in vcpkg.json portfile.cmake fix-plugin-dir.patch libdl.diff usage vcpkg-cmake-wrapper.cmake; do \
+        curl -fsSL "https://raw.githubusercontent.com/microsoft/vcpkg/$B/ports/alsa/$f" \
+            -o "/opt/overlay-ports/alsa/$f"; \
+    done; \
+    sed -i 's/set(LINUX_OPTIONS enable-alsa ALSA_FOUND)/set(LINUX_OPTIONS enable-alsa)/' /opt/overlay-ports/fluidsynth/portfile.cmake; \
+    sed -i 's/        --disable-python$/        --disable-python --without-versioned/' /opt/overlay-ports/alsa/portfile.cmake
+ENV VCPKG_OVERLAY_PORTS=/opt/overlay-ports
+
+WORKDIR /build
+RUN git clone https://github.com/dosbox-staging/dosbox-staging.git
+WORKDIR /build/dosbox-staging
+RUN git checkout v0.83.0
+
+# Configure CMake with Ninja and custom release triplet
+RUN cmake -G Ninja --preset=release-linux-vcpkg \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_C_COMPILER=/usr/bin/gcc \
+    -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
+    -DVCPKG_TARGET_TRIPLET=x64-linux-release \
+    -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja
+
+RUN cmake --build --preset=release-linux-vcpkg
+
+# Install into staging directory for packaging
+RUN DESTDIR=/pkg/install cmake --install build/release-linux
+
+# 2. Packaging Stage
+FROM debian:trixie AS packager
+RUN apt-get update && apt-get install -y dpkg-dev && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /pkg/dosbox-staging-zen5_0.83.0_amd64
+COPY --from=builder /pkg/install/ .
+
+# Fix asset path mismatch: cmake installs the resources under
+# usr/share/dosbox-staging/resources/, but the v0.83.0 runtime resource
+# lookup (get_resource_parent_paths/get_resource_path) probes
+# <datadir>/dosbox-staging directly (XDG data dirs) and never appends a
+# "resources" component — the meson install layout, which has no extra
+# level, is what the lookup expects. Flatten to match.
+RUN if [ -d usr/share/dosbox-staging/resources ]; then \
+        mv usr/share/dosbox-staging/resources/* usr/share/dosbox-staging/ && \
+        rmdir usr/share/dosbox-staging/resources; \
+    fi
+
+# --- CLEANUP ---
+RUN rm -rf usr/include \
+    && find . -name "pkgconfig" -type d -exec rm -rf {} + \
+    && find . -name "*.a" -delete \
+    && rm -rf usr/share/vcpkg usr/share/doc/*/vcpkg*
+
+# Create DEBIAN control file (printf: dash echo does not interpret \n).
+# All vcpkg dependencies (sdl2, fluidsynth, slirp, opusfile, mt32emu, ...)
+# are statically linked, so only the system libraries the binary actually
+# resolves against belong here.
+RUN mkdir -p DEBIAN
+RUN printf 'Package: dosbox-staging-zen5\nVersion: 0.83.0\nArchitecture: amd64\nMaintainer: brandon\nDepends: libgl1, libx11-6, libxext6, libxrandr2, libxcursor1, libxi6, libxfixes3, libxss1, libxrender1, libxinerama1, libxkbcommon0, libwayland-client0, libegl1\nDescription: DOSBox Staging optimized for Zen 5 (AVX-512) on Debian Trixie\n' \
+    > DEBIAN/control
+
+# Post-install script (printf: dash echo does not interpret \n)
+RUN printf '#!/bin/sh\nldconfig\ncommand -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q || true\n' \
+    > DEBIAN/postinst && chmod +x DEBIAN/postinst
+
+WORKDIR /pkg
+RUN dpkg-deb --build dosbox-staging-zen5_0.83.0_amd64
+
+# 3. Export
+FROM scratch AS export
+COPY --from=packager /pkg/dosbox-staging-zen5_0.83.0_amd64.deb /
